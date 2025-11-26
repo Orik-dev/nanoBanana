@@ -5,6 +5,8 @@ import time
 import redis.asyncio as aioredis
 import logging 
 import asyncio
+from datetime import datetime, timedelta
+from sqlalchemy import func, and_
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -26,7 +28,7 @@ from services.users import ensure_user
 from services.telegram_safe import safe_answer, safe_send_text,safe_edit_text
 from core.config import settings
 from db.engine import SessionLocal
-from db.models import User
+from db.models import User, Task, Payment
 from services.queue import enqueue_generation
 
 router = Router()
@@ -468,3 +470,142 @@ async def cb_model_select(c: CallbackQuery, state: FSMContext):
     
     # ✅ Автоматически запускаем генерацию
     await cmd_gen(c.message, state, user_id=c.from_user.id, show_intro=True)
+    
+# ======================= /stats (админ) =======================
+
+@router.message(Command("stats"))
+async def cmd_stats(m: Message, state: FSMContext):
+    """📊 Статистика за период (только для админа)"""
+    
+    # ✅ Проверка админа
+    if not settings.ADMIN_ID or m.from_user.id != settings.ADMIN_ID:
+        return
+    
+    await state.clear()
+    
+    # ✅ Парсинг аргументов: /stats, /stats week, /stats month
+    args = (m.text or "").split()
+    period = args[1].lower() if len(args) > 1 else "day"
+    
+    # ✅ Определяем период
+    now = datetime.utcnow()
+    if period == "week":
+        start = now - timedelta(days=7)
+        period_name = "неделю"
+    elif period == "month":
+        start = now - timedelta(days=30)
+        period_name = "месяц"
+    else:
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        period_name = f"сегодня ({start.strftime('%d.%m.%Y')})"
+    
+    async with SessionLocal() as s:
+        # 📊 ГЕНЕРАЦИИ
+        # Standard (1 кредит)
+        standard_count = await s.scalar(
+            select(func.count(Task.id)).where(
+                and_(
+                    Task.status == "completed",
+                    Task.credits_used == 1,
+                    Task.created_at >= start
+                )
+            )
+        ) or 0
+        
+        # Pro (5 кредитов)
+        pro_count = await s.scalar(
+            select(func.count(Task.id)).where(
+                and_(
+                    Task.status == "completed",
+                    Task.credits_used == 5,
+                    Task.created_at >= start
+                )
+            )
+        ) or 0
+        
+        # 💰 ВЫРУЧКА
+        # RUB (YooKassa)
+        revenue_rub = await s.scalar(
+            select(func.sum(Payment.rub_amount)).where(
+                and_(
+                    Payment.status == "succeeded",
+                    Payment.currency == "RUB",
+                    Payment.created_at >= start
+                )
+            )
+        ) or 0
+        
+        # Stars (считаем как отдельно)
+        revenue_stars = await s.scalar(
+            select(func.sum(Payment.rub_amount)).where(
+                and_(
+                    Payment.status == "succeeded",
+                    Payment.currency == "XTR",
+                    Payment.created_at >= start
+                )
+            )
+        ) or 0
+        
+        # 👥 ПОЛЬЗОВАТЕЛИ
+        new_users = await s.scalar(
+            select(func.count(User.id)).where(
+                User.created_at >= start
+            )
+        ) or 0
+        
+        # Активные (делали генерации)
+        active_users = await s.scalar(
+            select(func.count(func.distinct(Task.user_id))).where(
+                Task.created_at >= start
+            )
+        ) or 0
+        
+        # Платящие
+        paying_users = await s.scalar(
+            select(func.count(func.distinct(Payment.user_id))).where(
+                and_(
+                    Payment.status == "succeeded",
+                    Payment.created_at >= start
+                )
+            )
+        ) or 0
+    
+    # 📈 РАСЧЁТЫ
+    total_generations = standard_count + pro_count
+    total_revenue = float(revenue_rub) + float(revenue_stars)
+    avg_check = total_revenue / paying_users if paying_users > 0 else 0
+    conversion = (paying_users / active_users * 100) if active_users > 0 else 0
+    
+    # 💰 Реальная выручка (с учётом стоимости кредитов)
+    # Standard: 1 кредит ≈ ~5.5₽ (149₽/30), Pro: 5 кредитов ≈ ~27.5₽
+    
+    # 🎨 ФОРМАТИРОВАНИЕ
+    text = (
+        f"📊 <b>Статистика за {period_name}</b>\n\n"
+        
+        f"🖼 <b>Генерации:</b>\n"
+        f"├ Standard: <b>{standard_count}</b>\n"
+        f"├ Pro 4K: <b>{pro_count}</b>\n"
+        f"└ Всего: <b>{total_generations}</b>\n\n"
+        
+        f"💰 <b>Выручка:</b>\n"
+        f"├ Карты РФ: <b>{revenue_rub:.2f} ₽</b>\n"
+        f"├ Stars: <b>{revenue_stars:.0f} ⭐</b>\n"
+        f"└ Итого: <b>{total_revenue:.2f} ₽</b>\n\n"
+        
+        f"👥 <b>Пользователи:</b>\n"
+        f"├ Новых: <b>{new_users}</b>\n"
+        f"├ Активных: <b>{active_users}</b>\n"
+        f"└ Платящих: <b>{paying_users}</b>\n\n"
+        
+        f"📈 <b>Показатели:</b>\n"
+        f"├ Средний чек: <b>{avg_check:.2f} ₽</b>\n"
+        f"└ Конверсия: <b>{conversion:.1f}%</b>\n\n"
+        
+        f"💡 <i>Используйте:</i>\n"
+        f"<code>/stats day</code> — сегодня\n"
+        f"<code>/stats week</code> — неделя\n"
+        f"<code>/stats month</code> — месяц"
+    )
+    
+    await safe_send_text(m.bot, m.chat.id, text)    

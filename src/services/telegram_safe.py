@@ -712,52 +712,123 @@ async def safe_send_document(
 async def safe_edit_text(
     message: Message,
     text: str,
-    *,
+    parse_mode: Optional[str] = None,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
-    parse_mode: str = "HTML",
-    disable_web_page_preview: bool = False,
-):
-    # ✅ ИСПРАВЛЕНО: проверка на InaccessibleMessage
-    if isinstance(message, InaccessibleMessage):
-        log.warning("Attempted to edit inaccessible message")
+    disable_web_page_preview: bool = True,
+) -> Optional[Message]:
+    """
+    ✅ УЛУЧШЕНО: обработка всех типов ошибок редактирования
+    """
+    if not text or not text.strip():
+        log.warning("safe_edit_text: empty text provided")
         return None
-    
+
     try:
         return await message.edit_text(
-            text, 
-            reply_markup=reply_markup, 
-            parse_mode=parse_mode, 
-            disable_web_page_preview=disable_web_page_preview
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            disable_web_page_preview=disable_web_page_preview,
         )
     except TelegramBadRequest as e:
-        if _is_not_modified(e):
-            if reply_markup is not None:
-                try:
-                    return await message.edit_reply_markup(reply_markup=reply_markup)
-                except TelegramBadRequest as e2:
-                    if _is_not_modified(e2):
-                        return message
-                    log.exception("edit_reply_markup bad request (not 'modified')")
-                except Exception:
-                    log.exception("edit_reply_markup failed")
-            return message
-        log.exception("edit_text bad request")
+        error_msg = str(e).lower()
+        
+        # ✅ Сообщение не найдено - молча игнорируем
+        if "message to edit not found" in error_msg:
+            log.debug(
+                "safe_edit_text: message not found (deleted or too old), "
+                f"chat_id={message.chat.id}, message_id={message.message_id}"
+            )
+            return None
+        
+        # ✅ Сообщение не изменилось - молча игнорируем
+        if "message is not modified" in error_msg:
+            log.debug(
+                "safe_edit_text: message not modified, "
+                f"chat_id={message.chat.id}, message_id={message.message_id}"
+            )
+            return None
+        
+        # ✅ Сообщение слишком старое
+        if "message can't be edited" in error_msg:
+            log.debug(
+                "safe_edit_text: message too old to edit, "
+                f"chat_id={message.chat.id}, message_id={message.message_id}"
+            )
+            return None
+        
+        # ✅ Слишком длинное сообщение
+        if "message is too long" in error_msg:
+            log.warning(
+                "safe_edit_text: message too long, truncating, "
+                f"chat_id={message.chat.id}, length={len(text)}"
+            )
+            # Пробуем отправить урезанную версию
+            try:
+                truncated = text[:4000] + "\n\n... (обрезано)"
+                return await message.edit_text(
+                    text=truncated,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=disable_web_page_preview,
+                )
+            except Exception:
+                return None
+        
+        # ✅ Проблемы с parse_mode
+        if "can't parse" in error_msg or "parse entities" in error_msg:
+            log.warning(
+                "safe_edit_text: parse error, retrying without parse_mode, "
+                f"chat_id={message.chat.id}, error={e}"
+            )
+            try:
+                return await message.edit_text(
+                    text=text,
+                    parse_mode=None,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=disable_web_page_preview,
+                )
+            except Exception:
+                return None
+        
+        # ✅ Другие ошибки - логируем
+        log.error(
+            "edit_text bad request: %s, chat_id=%s, message_id=%s",
+            e,
+            message.chat.id,
+            message.message_id,
+            exc_info=False  # ✅ Без полного traceback
+        )
+        return None
+        
     except TelegramRetryAfter as e:
+        log.warning(
+            f"safe_edit_text: rate limit hit, retry_after={e.retry_after}s, "
+            f"chat_id={message.chat.id}"
+        )
         await asyncio.sleep(e.retry_after)
         try:
             return await message.edit_text(
-                text, 
-                reply_markup=reply_markup, 
+                text=text,
                 parse_mode=parse_mode,
-                disable_web_page_preview=disable_web_page_preview
+                reply_markup=reply_markup,
+                disable_web_page_preview=disable_web_page_preview,
             )
         except Exception:
-            log.exception("edit_text failed after retry")
-    except TelegramForbiddenError:
+            return None
+            
+    except TelegramNetworkError as e:
+        log.warning(
+            f"safe_edit_text: network error, chat_id={message.chat.id}, error={e}"
+        )
         return None
-    except Exception:
-        log.exception("edit_text failed")
-    return None
+        
+    except Exception as e:
+        log.exception(
+            "safe_edit_text: unexpected error, "
+            f"chat_id={message.chat.id}, message_id={message.message_id}"
+        )
+        return None
 
 async def safe_edit_reply_markup(
     message: Message,

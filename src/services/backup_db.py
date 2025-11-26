@@ -281,8 +281,8 @@ async def backup_database_task(ctx):
                 "--skip-ssl",
                 "--no-tablespaces",
                 "--max-allowed-packet=512M",  # ✅ ДОБАВЛЕНО
-                "--net-read-timeout=600",      # ✅ ДОБАВЛЕНО: 10 минут
-                "--net-write-timeout=600",     # ✅ ДОБАВЛЕНО: 10 минут
+                # "--net-read-timeout=600",      # ✅ ДОБАВЛЕНО: 10 минут
+                # "--net-write-timeout=600",     # ✅ ДОБАВЛЕНО: 10 минут
                 database  
             ]
             
